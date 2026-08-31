@@ -4,6 +4,8 @@ import customtkinter as ctk
 import serial
 import serial.tools.list_ports
  
+#커밋이되나확인
+
 # 글로벌 변수 설정
 ser = None
 running = False
