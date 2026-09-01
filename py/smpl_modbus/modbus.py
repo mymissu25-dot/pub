@@ -112,67 +112,76 @@ def parse_response(func_code, resp: bytes, quantity):
 
 # --- 로그/결과 출력 함수 ---
 
+# --- 로그/결과 출력 함수 ---
+# 아래 함수들은 계속읽기 스레드 등 백그라운드 스레드에서도 호출되므로,
+# 실제 위젯 변경은 window.after(0, ...)로 메인 스레드(Tk 이벤트 루프)에 맡깁니다.
+# 이렇게 하면 "왼쪽으로 튀었다가 복원되는" 중간 상태가 화면에 그려질 틈 없이
+# 한 번에(원자적으로) 반영됩니다.
+
 def log_message(message):
-    # see("end")가 새 줄(맨 왼쪽 칸)을 기준으로 스크롤을 맞추면서 가로 스크롤이
-    # 왼쪽으로 되돌아가버리는 것을 막기 위해, 기존 가로 스크롤 위치를 기억했다가 복원합니다.
-    x_frac = log_area.xview()[0]
-    log_area.configure(state="normal")
-    log_area.insert("end", message + "\n")
-    log_area.see("end")
-    log_area.xview_moveto(x_frac)
-    log_area.configure(state="disabled")
+    def _apply():
+        log_area.configure(state="normal")
+        log_area.insert("end", message + "\n")
+        # see() 대신 세로 스크롤만 맨 아래로 이동시켜서 가로 스크롤 위치는 아예 건드리지 않습니다.
+        log_area.yview_moveto(1.0)
+        log_area.configure(state="disabled")
+    window.after(0, _apply)
 
 def show_result(func_code, start_addr, values):
-    # 결과창 전체를 지우고 다시 그리기 때문에, 사용자가 봐둔 가로 스크롤 위치를
-    # 기억했다가 다시 그린 뒤 복원해서 자동으로 왼쪽 끝으로 튀지 않게 합니다.
-    x_frac = result_area.xview()[0]
+    def _apply():
+        # 결과창은 매번 전체를 지우고 다시 그리기 때문에, 그리기 전 가로 스크롤 위치를
+        # 기억했다가 그린 직후 같은 이벤트 루프 처리 안에서 바로 복원합니다.
+        x_frac = result_area.xview()[0]
 
-    result_area.configure(state="normal")
-    result_area.delete("1.0", "end")
+        result_area.configure(state="normal")
+        result_area.delete("1.0", "end")
 
-    # 세로로 채우다가 RESULT_ROWS_PER_COLUMN줄이 넘으면 오른쪽에 새 칸(열)을 만들어 이어서 표시
-    col1_width = 6   # 번호 칸
-    col2_width = 10  # 값 칸
-    col_gap = "   "
+        # 세로로 채우다가 RESULT_ROWS_PER_COLUMN줄이 넘으면 오른쪽에 새 칸(열)을 만들어 이어서 표시
+        col1_width = 6   # 번호 칸
+        col2_width = 10  # 값 칸
+        col_gap = "   "
 
-    num_items = len(values)
-    num_cols = max(1, -(-num_items // RESULT_ROWS_PER_COLUMN))  # 올림 나눗셈
+        num_items = len(values)
+        num_cols = max(1, -(-num_items // RESULT_ROWS_PER_COLUMN))  # 올림 나눗셈
 
-    header_cell = f"{'번호':>{col1_width}} | {'값':<{col2_width}}"
-    sep_cell = ("-" * col1_width) + "-+-" + ("-" * col2_width)
-    blank_cell = " " * len(header_cell)
+        header_cell = f"{'번호':>{col1_width}} | {'값':<{col2_width}}"
+        sep_cell = ("-" * col1_width) + "-+-" + ("-" * col2_width)
+        blank_cell = " " * len(header_cell)
 
-    result_area.insert("end", col_gap.join([header_cell] * num_cols) + "\n")
-    result_area.insert("end", col_gap.join([sep_cell] * num_cols) + "\n")
+        result_area.insert("end", col_gap.join([header_cell] * num_cols) + "\n")
+        result_area.insert("end", col_gap.join([sep_cell] * num_cols) + "\n")
 
-    for row in range(RESULT_ROWS_PER_COLUMN):
-        row_cells = []
-        row_has_item = False
-        for col in range(num_cols):
-            idx = col * RESULT_ROWS_PER_COLUMN + row
-            if idx < num_items:
-                row_has_item = True
-                num = start_addr + idx
-                val = values[idx]
-                if func_code in (0x01, 0x02):
-                    val_str = "ON" if val else "OFF"
+        for row in range(RESULT_ROWS_PER_COLUMN):
+            row_cells = []
+            row_has_item = False
+            for col in range(num_cols):
+                idx = col * RESULT_ROWS_PER_COLUMN + row
+                if idx < num_items:
+                    row_has_item = True
+                    num = start_addr + idx
+                    val = values[idx]
+                    if func_code in (0x01, 0x02):
+                        val_str = "ON" if val else "OFF"
+                    else:
+                        val_str = str(val)
+                    cell = f"{num:>{col1_width}} | {val_str:<{col2_width}}"
                 else:
-                    val_str = str(val)
-                cell = f"{num:>{col1_width}} | {val_str:<{col2_width}}"
-            else:
-                cell = blank_cell
-            row_cells.append(cell)
-        if row_has_item:
-            result_area.insert("end", col_gap.join(row_cells) + "\n")
+                    cell = blank_cell
+                row_cells.append(cell)
+            if row_has_item:
+                result_area.insert("end", col_gap.join(row_cells) + "\n")
 
-    result_area.configure(state="disabled")
-    result_area.xview_moveto(x_frac)
+        result_area.configure(state="disabled")
+        result_area.xview_moveto(x_frac)
+    window.after(0, _apply)
 
 def clear_result_with_message(msg):
-    result_area.configure(state="normal")
-    result_area.delete("1.0", "end")
-    result_area.insert("end", msg)
-    result_area.configure(state="disabled")
+    def _apply():
+        result_area.configure(state="normal")
+        result_area.delete("1.0", "end")
+        result_area.insert("end", msg)
+        result_area.configure(state="disabled")
+    window.after(0, _apply)
 
 # --- 포트 갱신 ---
 
@@ -227,7 +236,8 @@ def read_inputs():
     return target_port, baud, slave_id, func_code, start_addr, quantity
 
 def update_error_label():
-    error_label.configure(text=f"응답 에러: {error_count}회")
+    count = error_count
+    window.after(0, lambda: error_label.configure(text=f"응답 에러: {count}회"))
 
 # [한번 읽기] 버튼: 계속읽기 중이면 정지만 하고, 아니면 1회 읽기 실행
 def start_single_read():
@@ -298,7 +308,8 @@ def toggle_continuous():
     continuous_thread.start()
 
 def reset_continuous_button():
-    continuous_btn.configure(text="계속읽기 (0.2s/1s)", fg_color="green", hover_color="darkgreen")
+    window.after(0, lambda: continuous_btn.configure(
+        text="계속읽기 (0.2s/1s)", fg_color="green", hover_color="darkgreen"))
 
 def continuous_loop(port, baud, slave_id, func_code, start_addr, quantity):
     global ser, continuous_running, error_count
