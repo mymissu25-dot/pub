@@ -10,17 +10,27 @@ continuous_running = False
 continuous_thread = None
 error_count = 0
 
+# 여러 스레드(계속읽기 / 쓰기)가 동시에 같은 시리얼 포트에 접근하지 못하도록 막는 잠금.
+# 이 락을 잡은 스레드만 요청을 보내고 응답을 다 받을 때까지 포트를 독점합니다.
+serial_lock = threading.Lock()
+
 # 응답 프레임을 받을 때, 이 시간(초) 이상 새 데이터가 안 들어오면 응답이 끝난 것으로 간주합니다.
-FRAME_GAP_SEC = 0.05
+FRAME_GAP_SEC = 0.1  # 0.05 → 0.1로 증가 (응답 완전히 받을 시간 확보)
 
 # 계속읽기 모드 설정
 CONTINUOUS_INTERVAL_SEC = 0.2   # 요청 주기
-CONTINUOUS_RESPONSE_TIMEOUT = 1.0  # 요청당 최대 응답 대기 시간
+CONTINUOUS_RESPONSE_TIMEOUT = 1.5  # 1.0 → 1.5로 증가
 
-# 결과창에서 세로로 몇 줄 채우면 오른쪽에 새 칸을 시작할지 (낮은 해상도 화면 기준 10줄)
+# 계속읽기를 잠시 멈출 때, 실제로 스레드가 종료됐는지 기다리는 최대 시간
+CONTINUOUS_STOP_JOIN_TIMEOUT = CONTINUOUS_RESPONSE_TIMEOUT + 1.0
+
+# 결과창에서 세로로 몇 줄 채우면 오른쪽에 새 칸을 시작할지
 RESULT_ROWS_PER_COLUMN = 10
 
-# 지원할 모드버스 읽기 기능 코드
+# 지원할 모드버스 기능 코드
+# 주의: 06(단일 레지스터 쓰기)은 여기 목록에 넣지 않습니다. "한번 읽기"/"계속읽기" 버튼은
+# 항상 읽기 프레임만 생성하기 때문에, 콤보박스에서 06을 선택해 "읽기"를 누르면 엉뚱한
+# 쓰기 명령이 나가버립니다. 쓰기는 03으로 읽은 결과에서 값을 클릭해 여는 팝업으로만 합니다.
 FUNCTION_CODES = {
     "01: 코일 읽기 (Read Coils)": 0x01,
     "02: 디스크리트 입력 읽기 (Read Discrete Inputs)": 0x02,
@@ -38,9 +48,9 @@ MODBUS_EXCEPTIONS = {
 # --- GUI 화면 설정 ---
 ctk.set_appearance_mode("System")
 window = ctk.CTk()
-window.title("모드버스 RTU 마스터 (읽기)")
-window.geometry("700x640")  # 730 → 640
-window.minsize(680, 680)
+window.title("모드버스 RTU 마스터 (읽기/쓰기)")
+window.geometry("700x640")
+window.minsize(680, 640)
 
 # --- 모드버스 관련 함수 ---
 
@@ -57,7 +67,7 @@ def modbus_crc16(data: bytes) -> bytes:
                 crc >>= 1
     return crc.to_bytes(2, byteorder="little")
 
-# 읽기 요청 프레임 생성 (슬레이브ID + 기능코드 + 시작주소(2byte) + 개수(2byte) + CRC(2byte))
+# 읽기 요청 프레임 생성
 def build_read_request(slave_id, func_code, start_addr, quantity):
     frame = bytes([slave_id, func_code])
     frame += start_addr.to_bytes(2, "big")
@@ -65,31 +75,47 @@ def build_read_request(slave_id, func_code, start_addr, quantity):
     frame += modbus_crc16(frame)
     return frame
 
-# 수신된 응답 프레임의 CRC 검증
+# 쓰기 요청 프레임 생성 (06번)
+def build_write_request(slave_id, address, value):
+    frame = bytes([slave_id, 0x06])
+    frame += address.to_bytes(2, "big")
+    frame += value.to_bytes(2, "big")
+    frame += modbus_crc16(frame)
+    return frame
+
+# CRC 검증
 def check_crc(frame: bytes) -> bool:
     if len(frame) < 3:
         return False
     body, crc_recv = frame[:-2], frame[-2:]
     return modbus_crc16(body) == crc_recv
 
-# 응답 프레임 파싱 (성공 시 (값 리스트, None), 실패 시 (None, 에러메시지))
+# 응답 프레임 파싱 (CRC 오류 시 더 자세한 정보)
 def parse_response(func_code, resp: bytes, quantity):
     if len(resp) < 5:
-        return None, "응답 길이가 너무 짧습니다."
+        return None, f"응답 길이가 너무 짧습니다. (수신: {len(resp)}바이트)"
 
     if not check_crc(resp):
-        return None, "CRC 오류 (응답이 손상되었을 수 있습니다)."
+        return None, f"CRC 오류 (수신 프레임: {resp.hex(' ').upper()})"
 
     fc = resp[1]
-    if fc & 0x80:  # 예외 응답 (기능코드의 최상위 비트가 1)
+    if fc & 0x80:
         exc_code = resp[2]
         msg = MODBUS_EXCEPTIONS.get(exc_code, f"알 수 없는 예외 코드 {exc_code}")
         return None, f"모드버스 예외 응답: {msg}"
 
+    if func_code == 0x06:
+        if len(resp) >= 8:
+            address = int.from_bytes(resp[2:4], "big")
+            value = int.from_bytes(resp[4:6], "big")
+            return [value], None
+        else:
+            return None, "쓰기 응답 길이 오류"
+
     byte_count = resp[2]
     data = resp[3:3 + byte_count]
 
-    if func_code in (0x01, 0x02):  # 코일 / 디스크리트 입력: 비트 단위
+    if func_code in (0x01, 0x02):
         bits = []
         for i in range(quantity):
             byte_idx = i // 8
@@ -101,7 +127,7 @@ def parse_response(func_code, resp: bytes, quantity):
             bits.append(bit)
         return bits, None
 
-    elif func_code in (0x03, 0x04):  # 홀딩 / 입력 레지스터: 16bit 워드 단위
+    elif func_code in (0x03, 0x04):
         values = []
         for i in range(0, byte_count - 1, 2):
             val = (data[i] << 8) | data[i + 1]
@@ -111,38 +137,27 @@ def parse_response(func_code, resp: bytes, quantity):
     return None, "지원하지 않는 기능 코드입니다."
 
 # --- 로그/결과 출력 함수 ---
-
-# --- 로그/결과 출력 함수 ---
-# 아래 함수들은 계속읽기 스레드 등 백그라운드 스레드에서도 호출되므로,
-# 실제 위젯 변경은 window.after(0, ...)로 메인 스레드(Tk 이벤트 루프)에 맡깁니다.
-# 이렇게 하면 "왼쪽으로 튀었다가 복원되는" 중간 상태가 화면에 그려질 틈 없이
-# 한 번에(원자적으로) 반영됩니다.
-
 def log_message(message):
     def _apply():
         log_area.configure(state="normal")
         log_area.insert("end", message + "\n")
-        # see() 대신 세로 스크롤만 맨 아래로 이동시켜서 가로 스크롤 위치는 아예 건드리지 않습니다.
         log_area.yview_moveto(1.0)
         log_area.configure(state="disabled")
     window.after(0, _apply)
 
 def show_result(func_code, start_addr, values):
     def _apply():
-        # 결과창은 매번 전체를 지우고 다시 그리기 때문에, 그리기 전 가로 스크롤 위치를
-        # 기억했다가 그린 직후 같은 이벤트 루프 처리 안에서 바로 복원합니다.
         x_frac = result_area.xview()[0]
 
         result_area.configure(state="normal")
         result_area.delete("1.0", "end")
 
-        # 세로로 채우다가 RESULT_ROWS_PER_COLUMN줄이 넘으면 오른쪽에 새 칸(열)을 만들어 이어서 표시
-        col1_width = 6   # 번호 칸
-        col2_width = 10  # 값 칸
+        col1_width = 6
+        col2_width = 10
         col_gap = "   "
 
         num_items = len(values)
-        num_cols = max(1, -(-num_items // RESULT_ROWS_PER_COLUMN))  # 올림 나눗셈
+        num_cols = max(1, -(-num_items // RESULT_ROWS_PER_COLUMN))
 
         header_cell = f"{'번호':>{col1_width}} | {'값':<{col2_width}}"
         sep_cell = ("-" * col1_width) + "-+-" + ("-" * col2_width)
@@ -164,12 +179,21 @@ def show_result(func_code, start_addr, values):
                         val_str = "ON" if val else "OFF"
                     else:
                         val_str = str(val)
-                    cell = f"{num:>{col1_width}} | {val_str:<{col2_width}}"
+
+                    cell_text = f"{num:>{col1_width}} | {val_str:<{col2_width}}"
+                    cell_start = result_area.index("end-1c")
+                    result_area.insert("end", cell_text)
+                    cell_end = result_area.index("end-1c")
+
+                    tag_name = f"clickable_{num}"
+                    result_area.tag_add(tag_name, cell_start, cell_end)
+                    result_area.tag_config(tag_name, foreground="blue")
+                    result_area.tag_bind(tag_name, "<Button-1>",
+                                        lambda e, addr=num, val=val, fc=func_code: on_value_click(addr, val, fc))
                 else:
-                    cell = blank_cell
-                row_cells.append(cell)
+                    result_area.insert("end", blank_cell)
             if row_has_item:
-                result_area.insert("end", col_gap.join(row_cells) + "\n")
+                result_area.insert("end", "\n")
 
         result_area.configure(state="disabled")
         result_area.xview_moveto(x_frac)
@@ -183,8 +207,164 @@ def clear_result_with_message(msg):
         result_area.configure(state="disabled")
     window.after(0, _apply)
 
-# --- 포트 갱신 ---
+# --- 값 클릭 시 팝업창 (크게, 확인 버튼만) ---
+def on_value_click(address, current_value, func_code):
+    if func_code != 0x03:
+        log_message(f"⚠️ 주소 {address}는 쓰기 불가능한 타입입니다. (03번으로 읽은 값만 쓰기 가능)")
+        return
 
+    popup = ctk.CTkToplevel(window)
+    popup.title(f"레지스터 쓰기 - 주소 {address}")
+    popup.geometry("450x300")  # 크기 증가
+    popup.resizable(False, False)
+    popup.grab_set()
+
+    # 팝업창 내용
+    ctk.CTkLabel(popup, text=f"주소 {address}에 값 쓰기", font=("맑은 고딕", 18, "bold")).pack(pady=(25, 5))
+    ctk.CTkLabel(popup, text=f"현재 값: {current_value}", font=("맑은 고딕", 14)).pack(pady=(0, 15))
+
+    # 값 입력창
+    value_frame = ctk.CTkFrame(popup, fg_color="transparent")
+    value_frame.pack(pady=10)
+    ctk.CTkLabel(value_frame, text="새 값 (0~65535):", font=("맑은 고딕", 14)).pack(side="left", padx=10)
+    value_entry = ctk.CTkEntry(value_frame, width=180, height=40, font=("맑은 고딕", 16))
+    value_entry.insert(0, str(current_value))
+    value_entry.pack(side="left", padx=10)
+
+    # 상태 표시 레이블
+    status_label = ctk.CTkLabel(popup, text="", font=("맑은 고딕", 13))
+    status_label.pack(pady=15)
+
+    def do_write():
+        try:
+            new_value = int(value_entry.get())
+            if new_value < 0 or new_value > 65535:
+                status_label.configure(text="❌ 0~65535 범위의 값을 입력하세요.", text_color="red")
+                return
+
+            status_label.configure(text="⏳ 쓰는 중...", text_color="gray")
+            popup.update_idletasks()
+
+            success = write_single_register(address, new_value)
+            if success:
+                status_label.configure(text="✅ 쓰기 성공! 창을 닫아주세요.", text_color="green")
+                refresh_result()
+                popup.after(1500, popup.destroy)
+            else:
+                status_label.configure(text="❌ 쓰기 실패! 로그를 확인하세요.", text_color="red")
+        except ValueError:
+            status_label.configure(text="❌ 숫자를 입력하세요.", text_color="red")
+
+    # 버튼 프레임
+    btn_frame = ctk.CTkFrame(popup, fg_color="transparent")
+    btn_frame.pack(pady=20)
+
+    # 확인 버튼 (더 크게)
+    confirm_btn = ctk.CTkButton(btn_frame, text="✅ 확인", width=200, height=60,
+                                fg_color="#2ecc71", hover_color="#27ae60",
+                                font=("맑은 고딕", 18, "bold"),
+                                corner_radius=12,
+                                command=do_write)
+    confirm_btn.pack(padx=10)
+
+    # Enter 키로 확인 버튼 동작
+    value_entry.bind("<Return>", lambda e: do_write())
+
+    # 입력창에 포커스
+    value_entry.focus_set()
+
+# --- 쓰기 함수 ---
+def write_single_register(address, value):
+    global ser, continuous_running, continuous_thread
+
+    was_continuous = continuous_running
+
+    if was_continuous:
+        log_message("⏸️ 계속읽기 일시 중지 중...")
+        continuous_running = False
+        # sleep이 아니라 join으로 실제 스레드 종료를 확인합니다.
+        # (계속읽기 스레드가 응답을 기다리는 도중일 수 있어 최대 응답대기시간만큼은 걸릴 수 있습니다.)
+        if continuous_thread is not None:
+            continuous_thread.join(timeout=CONTINUOUS_STOP_JOIN_TIMEOUT)
+            if continuous_thread.is_alive():
+                log_message("⚠️ 계속읽기 스레드 정지 확인 시간 초과. 통신은 잠금으로 보호되니 계속 진행합니다.")
+
+    inputs = read_inputs()
+    if inputs is None:
+        if was_continuous:
+            continuous_running = True
+        return False
+
+    target_port, baud, slave_id, _, _, _ = inputs
+
+    try:
+        # 실제 포트 입출력은 반드시 잠금 안에서만 수행 (계속읽기와 절대 겹치지 않도록)
+        with serial_lock:
+            if ser is not None and ser.is_open:
+                log_message(f"🔗 기존 포트 {target_port} 재사용")
+            else:
+                log_message(f"🔌 포트 {target_port} 열기...")
+                ser = serial.Serial(target_port, baud, timeout=0.5)
+
+            request = build_write_request(slave_id, address, value)
+            ser.reset_input_buffer()
+            ser.write(request)
+
+            log_message(f"[쓰기 송신] {request.hex(' ').upper()}")
+
+            # 응답 대기 (충분히 대기)
+            time.sleep(0.1)
+            response = ser.read(8)
+
+        if not response:
+            log_message("❌ 쓰기 응답 없음 (타임아웃)")
+            return False
+
+        log_message(f"[쓰기 수신] {response.hex(' ').upper()}")
+
+        _, err = parse_response(0x06, response, 1)
+        if err:
+            log_message(f"❌ 쓰기 오류: {err}")
+            return False
+
+        log_message(f"✅ 주소 {address}에 값 {value} 쓰기 성공!")
+        return True
+
+    except PermissionError:
+        log_message(f"❌ 포트 {target_port} 사용 중! 다른 프로그램을 종료하세요.")
+        return False
+    except Exception as e:
+        log_message(f"❌ 쓰기 오류 발생: {str(e)}")
+        return False
+    finally:
+        if was_continuous:
+            try:
+                slave_id = int(slave_entry.get())
+                func_code = FUNCTION_CODES[func_combo.get()]
+                start_addr = int(addr_entry.get())
+                quantity = int(qty_entry.get())
+
+                continuous_running = True
+                continuous_btn.configure(text="■ 정지", fg_color="red", hover_color="darkred")
+
+                continuous_thread = threading.Thread(
+                    target=continuous_loop_with_existing_ser,
+                    args=(target_port, baud, slave_id, func_code, start_addr, quantity),
+                    daemon=True,
+                )
+                continuous_thread.start()
+                log_message("▶ 계속읽기 재개")
+            except Exception as e:
+                log_message(f"❌ 계속읽기 재개 실패: {str(e)}")
+                continuous_running = False
+                reset_continuous_button()
+
+def refresh_result():
+    if continuous_running:
+        return
+    threading.Thread(target=_do_single_read, daemon=True).start()
+
+# --- 포트 갱신 ---
 def refresh_ports():
     ports = [p.device for p in serial.tools.list_ports.comports()]
     if not ports:
@@ -192,30 +372,45 @@ def refresh_ports():
     port_combo.configure(values=ports)
     port_combo.set(ports[0])
 
-# --- 읽기 요청 실행 ---
-
-# 요청 1회 전송 + 응답 수신 (공용 함수). 프레임 갭 기반으로 끊어 읽음.
+# --- 읽기 요청 실행 (개선된 버전) ---
 def send_and_receive(ser_obj, slave_id, func_code, start_addr, quantity, response_timeout):
-    request = build_read_request(slave_id, func_code, start_addr, quantity)
-    ser_obj.reset_input_buffer()
-    ser_obj.write(request)
+    # 요청 전송 + 응답 수신 전체를 하나의 원자적 트랜잭션으로 취급합니다.
+    # 이 락이 걸려있는 동안은 다른 스레드(쓰기 등)가 같은 포트에 절대 접근할 수 없습니다.
+    with serial_lock:
+        request = build_read_request(slave_id, func_code, start_addr, quantity)
+        ser_obj.reset_input_buffer()
+        ser_obj.write(request)
 
-    buffer = bytearray()
-    deadline = time.time() + response_timeout
-    last_recv_time = time.time()
+        buffer = bytearray()
+        deadline = time.time() + response_timeout
+        last_recv_time = time.time()
 
-    while time.time() < deadline:
-        if ser_obj.in_waiting > 0:
-            buffer += ser_obj.read(ser_obj.in_waiting)
-            last_recv_time = time.time()
-        elif buffer and (time.time() - last_recv_time) >= FRAME_GAP_SEC:
-            break
+        # 예상 응답 길이 (함수 코드별로 다름: 01/02는 비트단위, 03/04는 레지스터단위)
+        if func_code in (0x01, 0x02):
+            data_bytes = (quantity + 7) // 8
         else:
-            time.sleep(0.005)
+            data_bytes = quantity * 2
+        expected_len = 5 + data_bytes
+
+        while time.time() < deadline:
+            if ser_obj.in_waiting > 0:
+                buffer += ser_obj.read(ser_obj.in_waiting)
+                last_recv_time = time.time()
+
+                # 예상 길이만큼 받았으면 잠시 더 기다렸다가(혹시 남은 바이트) 종료
+                if len(buffer) >= expected_len:
+                    time.sleep(0.02)
+                    if ser_obj.in_waiting > 0:
+                        buffer += ser_obj.read(ser_obj.in_waiting)
+                    break
+
+            elif buffer and (time.time() - last_recv_time) >= FRAME_GAP_SEC:
+                break
+            else:
+                time.sleep(0.01)
 
     return request, bytes(buffer)
 
-# 입력창 값 읽기 + 검증 (실패 시 None 반환)
 def read_inputs():
     target_port = port_combo.get()
     if target_port == "연결된 포트 없음":
@@ -239,7 +434,6 @@ def update_error_label():
     count = error_count
     window.after(0, lambda: error_label.configure(text=f"응답 에러: {count}회"))
 
-# [한번 읽기] 버튼: 계속읽기 중이면 정지만 하고, 아니면 1회 읽기 실행
 def start_single_read():
     global continuous_running
     if continuous_running:
@@ -255,8 +449,22 @@ def _do_single_read():
         return
     target_port, baud, slave_id, func_code, start_addr, quantity = inputs
 
+    for attempt in range(3):
+        try:
+            ser = serial.Serial(target_port, baud, timeout=0.02)
+            break
+        except PermissionError:
+            log_message(f"⚠️ 포트 {target_port} 사용 중... 재시도 {attempt+1}/3")
+            time.sleep(1)
+        except Exception as e:
+            log_message(f"❌ 포트 열기 실패: {str(e)}")
+            return
+
+    if ser is None or not ser.is_open:
+        log_message("❌ 포트를 열 수 없습니다.")
+        return
+
     try:
-        ser = serial.Serial(target_port, baud, timeout=0.02)
         request, response = send_and_receive(ser, slave_id, func_code, start_addr, quantity, response_timeout=1.5)
         ser.close()
 
@@ -282,12 +490,11 @@ def _do_single_read():
         if ser and ser.is_open:
             ser.close()
 
-# [계속읽기(0.2s/1s)] 버튼: 토글 방식. 다시 누르면 정지
 def toggle_continuous():
     global continuous_running, continuous_thread, error_count
 
     if continuous_running:
-        continuous_running = False  # continuous_loop가 스스로 정리하고 버튼을 되돌림
+        continuous_running = False
         return
 
     inputs = read_inputs()
@@ -351,7 +558,63 @@ def continuous_loop(port, baud, slave_id, func_code, start_addr, quantity):
             else:
                 show_result(func_code, start_addr, values)
 
-        # 0.2초 주기를 맞추되, 정지 요청이 오면 바로 반응하도록 잘게 나눠서 대기
+        remain = CONTINUOUS_INTERVAL_SEC - (time.time() - cycle_start)
+        while remain > 0 and continuous_running:
+            step = min(0.02, remain)
+            time.sleep(step)
+            remain -= step
+
+    if ser and ser.is_open:
+        ser.close()
+    log_message("■ 계속읽기 정지")
+    reset_continuous_button()
+
+# 기존 ser 객체를 재사용하는 계속읽기 루프
+def continuous_loop_with_existing_ser(port, baud, slave_id, func_code, start_addr, quantity):
+    global ser, continuous_running, error_count
+
+    if ser is None or not ser.is_open:
+        try:
+            ser = serial.Serial(port, baud, timeout=0.02)
+        except Exception as e:
+            log_message(f"❌ 포트 열기 실패: {str(e)}")
+            continuous_running = False
+            reset_continuous_button()
+            return
+
+    log_message(f"▶ 계속읽기 재개 ({port}, {baud}bps)")
+
+    while continuous_running:
+        cycle_start = time.time()
+        try:
+            if ser is None or not ser.is_open:
+                log_message("❌ 포트가 닫혔습니다. 계속읽기 중지")
+                break
+
+            request, response = send_and_receive(
+                ser, slave_id, func_code, start_addr, quantity,
+                response_timeout=CONTINUOUS_RESPONSE_TIMEOUT,
+            )
+        except Exception as e:
+            log_message(f"❌ 통신 오류: {str(e)}")
+            break
+
+        log_message(f"[송신] {request.hex(' ').upper()}")
+
+        if not response:
+            error_count += 1
+            log_message(f"❌ 응답 없음 (타임아웃) - 누적 오류 {error_count}회")
+            update_error_label()
+        else:
+            log_message(f"[수신] {response.hex(' ').upper()}")
+            values, err = parse_response(func_code, response, quantity)
+            if err:
+                error_count += 1
+                log_message(f"❌ {err} - 누적 오류 {error_count}회")
+                update_error_label()
+            else:
+                show_result(func_code, start_addr, values)
+
         remain = CONTINUOUS_INTERVAL_SEC - (time.time() - cycle_start)
         while remain > 0 and continuous_running:
             step = min(0.02, remain)
@@ -373,12 +636,10 @@ def on_closing():
 
 window.protocol("WM_DELETE_WINDOW", on_closing)
 
-# --- UI 레이아웃 배치 (1024x768 저해상도 화면에서도 스크롤 없이 보이도록 촘촘하게 배치) ---
-
+# --- UI 레이아웃 배치 ---
 title_label = ctk.CTkLabel(window, text="Modbus RTU Master", font=("맑은 고딕", 18, "bold"))
 title_label.pack(pady=(8, 4))
 
-# 포트/속도 설정
 port_frame = ctk.CTkFrame(window, fg_color="transparent")
 port_frame.pack(pady=2)
 
@@ -394,7 +655,6 @@ baud_combo.grid(row=0, column=3, padx=4)
 btn_refresh = ctk.CTkButton(port_frame, text="🔄 갱신", width=55, height=26, command=refresh_ports)
 btn_refresh.grid(row=0, column=4, padx=4)
 
-# 모드버스 요청 설정
 modbus_frame = ctk.CTkFrame(window, fg_color="transparent")
 modbus_frame.pack(pady=4)
 
@@ -432,21 +692,15 @@ continuous_btn.grid(row=0, column=1, padx=6)
 error_label = ctk.CTkLabel(btn_frame, text="응답 에러: 0회")
 error_label.grid(row=0, column=2, padx=12)
 
-# 결과 표시 영역 (기본 10줄까지는 스크롤 없이 세로로, 넘으면 오른쪽에 새 칸)
-ctk.CTkLabel(window, text="결과", font=("맑은 고딕", 13, "bold")).pack(pady=(4, 0))
+ctk.CTkLabel(window, text="결과 (값을 클릭하면 쓰기 팝업이 열립니다)", font=("맑은 고딕", 13, "bold")).pack(pady=(4, 0))
 result_area = ctk.CTkTextbox(window, width=660, height=120, font=("Consolas", 12), wrap="none")
 result_area.pack(pady=3, padx=10, fill="both", expand=True)
 result_area.configure(state="disabled")
 
-# 통신 로그(송/수신 프레임) 표시 영역
-# wrap="none": 수신 프레임(HEX)이 길어도 자동으로 줄바꿈되지 않고 한 줄로 유지되며,
-# 필요하면 가로 스크롤로 확인합니다.
 ctk.CTkLabel(window, text="통신 로그 (HEX)", font=("맑은 고딕", 13, "bold")).pack(pady=(4, 0))
 log_area = ctk.CTkTextbox(window, width=660, height=170, font=("Consolas", 11), wrap="none")
 log_area.pack(pady=(3, 8), padx=10, fill="x")
 log_area.configure(state="disabled")
 
-# 실행 시 사용 가능한 포트 자동 검색
 refresh_ports()
-
 window.mainloop()
