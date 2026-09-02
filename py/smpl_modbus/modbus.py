@@ -39,7 +39,7 @@ MODBUS_EXCEPTIONS = {
 ctk.set_appearance_mode("System")
 window = ctk.CTk()
 window.title("모드버스 RTU 마스터 (읽기)")
-window.geometry("700x730")
+window.geometry("700x640")  # 730 → 640
 window.minsize(680, 680)
 
 # --- 모드버스 관련 함수 ---
@@ -434,7 +434,7 @@ error_label.grid(row=0, column=2, padx=12)
 
 # 결과 표시 영역 (기본 10줄까지는 스크롤 없이 세로로, 넘으면 오른쪽에 새 칸)
 ctk.CTkLabel(window, text="결과", font=("맑은 고딕", 13, "bold")).pack(pady=(4, 0))
-result_area = ctk.CTkTextbox(window, width=660, height=250, font=("Consolas", 12), wrap="none")
+result_area = ctk.CTkTextbox(window, width=660, height=120, font=("Consolas", 12), wrap="none")
 result_area.pack(pady=3, padx=10, fill="both", expand=True)
 result_area.configure(state="disabled")
 
@@ -442,7 +442,7 @@ result_area.configure(state="disabled")
 # wrap="none": 수신 프레임(HEX)이 길어도 자동으로 줄바꿈되지 않고 한 줄로 유지되며,
 # 필요하면 가로 스크롤로 확인합니다.
 ctk.CTkLabel(window, text="통신 로그 (HEX)", font=("맑은 고딕", 13, "bold")).pack(pady=(4, 0))
-log_area = ctk.CTkTextbox(window, width=660, height=110, font=("Consolas", 11), wrap="none")
+log_area = ctk.CTkTextbox(window, width=660, height=170, font=("Consolas", 11), wrap="none")
 log_area.pack(pady=(3, 8), padx=10, fill="x")
 log_area.configure(state="disabled")
 
